@@ -3,3 +3,4 @@ onnxruntime
 pillow
 python-multipart
 python-dotenv
+flask-cors
