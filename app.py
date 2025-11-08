@@ -119,4 +119,4 @@ def predict_image():
         return err("INFERENCE_ERROR", str(e), status=500)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT, debug=True)
+    app.run(debug=True)
