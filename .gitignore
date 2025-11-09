@@ -54,3 +54,8 @@ migrations/
 *.tmp
 *.bak
 *.swp
+
+# Server File
+hello.py
+passenger_wsgi.py
+tmp/

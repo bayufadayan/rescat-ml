@@ -73,6 +73,11 @@ def _unhandled(e):
     log.exception("UNHANDLED: %s", e)
     return err("INTERNAL_ERROR", "Unexpected error", status=500)
 
+# Main Route
+@app.get("/")
+def home():
+    return "API is Running"
+
 # ===== Health =====
 @app.get("/healthz")
 def healthz():
