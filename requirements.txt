@@ -7,3 +7,4 @@ flask-cors
 ultralytics
 opencv-python
 numpy
+requests

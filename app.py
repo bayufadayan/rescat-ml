@@ -1,3 +1,4 @@
+# app.py
 """
 ResCat API — Flask-based service for cat recognition and face detection.
 
@@ -20,6 +21,7 @@ from utils.validation import validate_upload, MAX_FILE_MB
 from utils.responses import ok, err
 from inference import CatClassifier
 from yolo_face import CatFaceDetector
+from utils.uploader import upload_image_bytes  # <--- NEW
 
 # Optional CORS
 CORS_ENABLED = os.getenv("CORS_ENABLED", "false").lower() == "true"
@@ -45,6 +47,10 @@ MID_CONF = float(os.getenv("MID_CONF", "0.50"))
 HI_COUNT = float(os.getenv("HI_COUNT", "0.75"))
 HI_PRIORITY = float(os.getenv("HI_PRIORITY", "0.80"))
 MAX_DET = int(os.getenv("MAX_DET", "5"))
+
+# Upload buckets
+BUCKET_PREVIEW = os.getenv("BUCKET_PREVIEW", "preview-bounding-box")
+BUCKET_ROI = os.getenv("BUCKET_ROI", "roi-face-cat")
 
 # ================== Logger ==================
 logging.basicConfig(
@@ -97,13 +103,11 @@ except Exception as e:
 # ================== Request Lifecycle ==================
 @app.before_request
 def before_request():
-    """Generate request ID and start timer."""
     g.request_id = str(uuid.uuid4())[:8]
     g.t0 = time.time()
 
 @app.after_request
 def after_request(resp):
-    """Attach request metadata (X-Request-ID, latency)."""
     dur_ms = int((time.time() - getattr(g, "t0", time.time())) * 1000)
     resp.headers["X-Request-ID"] = getattr(g, "request_id", "-")
     resp.headers["X-Response-Time-ms"] = str(dur_ms)
@@ -114,30 +118,23 @@ def after_request(resp):
 # ================== Error Handlers ==================
 @app.errorhandler(413)
 def request_too_large(e):
-    """Return error if file exceeds limit."""
     return err("FILE_TOO_LARGE", f"Max {MAX_FILE_MB} MB", status=413)
 
 @app.errorhandler(Exception)
 def unhandled_exception(e):
-    """Global exception handler."""
     log.exception("UNHANDLED: %s", e)
     return err("INTERNAL_ERROR", "Unexpected error", status=500)
 
 # ================== Helper Functions ==================
+
 def read_image_bytes_from_form():
-    """
-    Read and validate uploaded image from form-data field 'file'.
-    Returns: (bytes, error_response)
-    """
     if "file" not in request.files:
         return None, err("INVALID_FILE", "Expect form-data field 'file'")
-    
     file = request.files["file"]
     is_valid, code, msg = validate_upload(file)
     if not is_valid:
         status = 415 if code == "UNSUPPORTED_MEDIA_TYPE" else 400
         return None, err(code, msg, status=status)
-
     try:
         image_bytes = file.read()
         _img = Image.open(io.BytesIO(image_bytes))
@@ -148,23 +145,40 @@ def read_image_bytes_from_form():
     except Exception as e:
         return None, err("INVALID_FILE", f"Failed to read image: {e}", status=400)
 
-def human_message(is_cat: bool, face_ok: bool) -> str:
-    """Return human-friendly detection message."""
-    if not is_cat and not face_ok:
-        return "Kami tidak mendeteksi kucing."
-    if is_cat and not face_ok:
-        return "Wajah kurang terlihat jelas. Pastikan pencahayaan baik dan area cukup luas."
-    return "Deteksi valid."
+
+def _upload_artifacts(base_name: str, fr) -> dict:
+    """
+    Upload preview & ROI bila tersedia. Return dict payload untuk JSON.
+    base_name: string unik (mis. timestamp + request_id) → dipakai sebagai original filename.
+    """
+    out = {"preview": None, "roi": None}
+
+    # Preview (bounding box)
+    if getattr(fr, "preview_jpeg", None):
+        up = upload_image_bytes(fr.preview_jpeg, BUCKET_PREVIEW, f"{base_name}-preview.jpg")
+        if up.get("ok"):
+            out["preview"] = {"filename": up.get("filename"), "url": up.get("url")}
+        else:
+            out["preview_error"] = up.get("message", "Upload preview failed")
+
+    # ROI (crop)
+    if getattr(fr, "roi_jpeg", None):
+        up = upload_image_bytes(fr.roi_jpeg, BUCKET_ROI, f"{base_name}-roi.jpg")
+        if up.get("ok"):
+            out["roi"] = {"filename": up.get("filename"), "url": up.get("url")}
+        else:
+            out["roi_error"] = up.get("message", "Upload ROI failed")
+
+    return out
+
 
 # ================== Routes ==================
 @app.get("/")
 def root_redirect():
-    """Redirect to /v1 root."""
     return redirect(url_for("v1_root"), code=302)
 
 @app.get("/v1")
 def v1_root():
-    """Return service status info for API root."""
     data = {
         "service": "ResCat API",
         "version": "v1",
@@ -175,12 +189,10 @@ def v1_root():
 
 @app.get("/healthz")
 def healthz():
-    """Simple health check endpoint."""
     return ok({"recognizer_loaded": MODEL_READY, "face_loaded": FACE_READY})
 
 @app.post("/v1/cat/recognize")
 def recognize_cat():
-    """POST image → classify cat + optional face detection."""
     if not MODEL_READY:
         return err("MODEL_NOT_READY", "Classifier not loaded", status=503)
     if not FACE_READY:
@@ -205,11 +217,13 @@ def recognize_cat():
         "meta": {**res.meta, "api_latency_ms": int((time.time() - g.t0) * 1000)}
     }
 
-    # Optional face detection chaining
-    faces_payload = None
+    # Face detection + upload artifacts
     if FACE_READY:
         try:
-            fr = app.face_detector.detect(image_bytes, include_roi_b64=True)
+            fr = app.face_detector.detect(image_bytes, include_roi_b64=False)
+            base_name = f"{int(time.time()*1000)}-{g.request_id}"
+            uploads = _upload_artifacts(base_name, fr)
+
             faces_payload = {
                 "ok": fr.ok,
                 "faces_count": fr.faces_count,
@@ -218,17 +232,19 @@ def recognize_cat():
                 "note": fr.note,
                 "kept_confs_ge_min": fr.kept_confs_ge_min,
                 "meta": fr.meta,
-                "roi_b64": fr.roi_b64
+                # tambahkan URL hasil upload (tanpa base64)
+                **uploads
             }
         except Exception as e:
             faces_payload = {"ok": False, "error": f"Face detector error: {e}"}
-    payload["faces"] = faces_payload
+        payload["faces"] = faces_payload
+    else:
+        payload["faces"] = None
 
     return ok(payload)
 
 @app.post("/v1/cat/faces")
 def detect_faces():
-    """POST image → detect faces only."""
     if not FACE_READY:
         return err("MODEL_NOT_READY", "Face detector not loaded", status=503)
 
@@ -237,7 +253,10 @@ def detect_faces():
         return error_resp
 
     try:
-        fr = app.face_detector.detect(image_bytes, include_roi_b64=True)
+        fr = app.face_detector.detect(image_bytes, include_roi_b64=False)
+        base_name = f"{int(time.time()*1000)}-{g.request_id}"
+        uploads = _upload_artifacts(base_name, fr)
+
         return ok({
             "request_id": g.request_id,
             "faces_count": fr.faces_count,
@@ -246,7 +265,7 @@ def detect_faces():
             "note": fr.note,
             "kept_confs_ge_min": fr.kept_confs_ge_min,
             "meta": fr.meta,
-            "roi_b64": fr.roi_b64
+            **uploads
         })
     except Exception as e:
         return err("INFERENCE_ERROR", f"Face detector error: {e}", status=500)

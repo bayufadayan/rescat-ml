@@ -1,6 +1,7 @@
+# yolo_face.py
 import base64, io, os
 from dataclasses import dataclass
-from typing import Dict, Any, Tuple
+from typing import Dict, Any
 
 import cv2
 import numpy as np
@@ -18,18 +19,18 @@ class FaceResult:
     note: str
     kept_confs_ge_min: list[float]
     meta: Dict[str, Any]
+    # --- baru ---
+    preview_jpeg: bytes | None
+    roi_jpeg: bytes | None
+    # opsional legacy (tidak dipakai di JSON akhir)
     roi_b64: str | None
 
 
 class CatFaceDetector:
     """
     Detektor wajah kucing (cat-head) ONNX via Ultralytics.
-    Aturan:
-      - faces_count > 1 hanya jika >= 2 box dengan conf >= HI_COUNT (default 0.75)
-      - ROI dipilih dengan prioritas:
-          1) conf >= HI_PRIORITY (0.80) → pilih conf tertinggi (tie-break area terbesar)
-          2) kalau tidak ada, pilih dari conf >= MID_CONF (0.50)
-          3) kalau tidak ada, pilih dari conf >= MIN_CONF (0.40)
+    Aturan jumlah wajah & prioritas ROI sama seperti versi sebelumnya.
+    Sekarang menambahkan gambar preview (bounding-box) dan ROI sebagai bytes.
     """
 
     def __init__(self,
@@ -44,7 +45,7 @@ class CatFaceDetector:
                  max_det: int = 5):
         if not os.path.exists(onnx_path):
             raise FileNotFoundError(f"Cat-Head ONNX not found: {onnx_path}")
-        self.model = YOLO(onnx_path)  # Ultralytics → onnxruntime backend otomatis
+        self.model = YOLO(onnx_path)
         self.classes_path = classes_path
         self.img_size = int(img_size)
         self.conf_raw = float(conf_raw)
@@ -57,7 +58,6 @@ class CatFaceDetector:
 
     @staticmethod
     def _bytes_to_bgr(image_bytes: bytes) -> np.ndarray:
-        # Decode via PIL → RGB → BGR (lebih robust terhadap beragam format)
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         arr = np.array(img)[:, :, ::-1]  # RGB->BGR
         return arr
@@ -69,6 +69,11 @@ class CatFaceDetector:
             return ""
         return base64.b64encode(buf.tobytes()).decode("ascii")
 
+    @staticmethod
+    def _encode_jpeg_bytes(bgr: np.ndarray) -> bytes | None:
+        ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+        return buf.tobytes() if ok else None
+
     def _pick_idx(self, confs: np.ndarray, xyxy: np.ndarray, mask: np.ndarray | list[int]):
         idxs = np.where(mask)[0] if isinstance(mask, np.ndarray) else np.array(mask, dtype=int)
         if len(idxs) == 0:
@@ -79,6 +84,24 @@ class CatFaceDetector:
             return int(best_idxs[0])
         areas = (xyxy[best_idxs, 2] - xyxy[best_idxs, 0]) * (xyxy[best_idxs, 3] - xyxy[best_idxs, 1])
         return int(best_idxs[np.argmax(areas)])
+
+    def _draw_preview(self, bgr: np.ndarray, xyxy: np.ndarray, confs: np.ndarray, chosen_idx: int | None, min_conf: float) -> bytes | None:
+        canvas = bgr.copy()
+        for i, (x1, y1, x2, y2) in enumerate(xyxy.astype(int)):
+            conf = float(confs[i])
+            if conf < min_conf:
+                continue
+            color = (0, 255, 0)
+            thickness = 2
+            if chosen_idx is not None and i == int(chosen_idx):
+                color = (0, 0, 255)  # highlight ROI terpilih
+                thickness = 3
+            cv2.rectangle(canvas, (x1, y1), (x2, y2), color, thickness)
+            label = f"{conf:.2f}"
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            cv2.rectangle(canvas, (x1, y1 - th - 6), (x1 + tw + 6, y1), color, -1)
+            cv2.putText(canvas, label, (x1 + 3, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        return self._encode_jpeg_bytes(canvas)
 
     def detect(self, image_bytes: bytes, include_roi_b64: bool = True) -> FaceResult:
         bgr = self._bytes_to_bgr(image_bytes)
@@ -93,8 +116,8 @@ class CatFaceDetector:
         )
         r = results[0]
 
-        # Tidak ada box sama sekali
         if r.boxes is None or len(r.boxes) == 0:
+            preview = self._encode_jpeg_bytes(bgr)  # tetap kirim original sebagai fallback preview
             return FaceResult(
                 ok=False,
                 faces_count=0,
@@ -103,7 +126,9 @@ class CatFaceDetector:
                 note="No boxes",
                 kept_confs_ge_min=[],
                 meta={"img_size": self.img_size, "conf_raw": self.conf_raw},
-                roi_b64=None
+                preview_jpeg=preview,
+                roi_jpeg=None,
+                roi_b64=None,
             )
 
         confs = r.boxes.conf.cpu().numpy()
@@ -111,6 +136,7 @@ class CatFaceDetector:
 
         keep_min = confs >= self.min_conf
         if not keep_min.any():
+            preview = self._draw_preview(bgr, xyxy, confs, None, self.min_conf)
             return FaceResult(
                 ok=False,
                 faces_count=0,
@@ -119,14 +145,16 @@ class CatFaceDetector:
                 note=f"Tidak ada box >= {self.min_conf:.2f}",
                 kept_confs_ge_min=[],
                 meta={"img_size": self.img_size, "conf_raw": self.conf_raw},
-                roi_b64=None
+                preview_jpeg=preview,
+                roi_jpeg=None,
+                roi_b64=None,
             )
 
-        # Hitung jumlah wajah (aturan revisi)
+        # Hitung jumlah wajah
         n_hi = int((confs >= self.hi_count).sum())
         faces_count = n_hi if n_hi >= 2 else 1
 
-        # Pilih ROI (prioritas berjenjang)
+        # Pilih ROI
         idx = self._pick_idx(confs, xyxy, confs >= self.hi_priority)
         if idx is None:
             idx = self._pick_idx(confs, xyxy, confs >= self.mid_conf)
@@ -134,10 +162,17 @@ class CatFaceDetector:
             idx = self._pick_idx(confs, xyxy, confs >= self.min_conf)
 
         x1, y1, x2, y2 = map(int, xyxy[idx])
+        roi_jpeg = None
         roi_b64 = None
-        if include_roi_b64:
-            roi = r.orig_img[y1:y2, x1:x2]
-            roi_b64 = self._encode_jpeg_b64(roi)
+        roi = r.orig_img[y1:y2, x1:x2]
+        ok_roi, buf_roi = cv2.imencode(".jpg", roi, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+        if ok_roi:
+            roi_bytes = buf_roi.tobytes()
+            roi_jpeg = roi_bytes
+            if include_roi_b64:
+                roi_b64 = base64.b64encode(roi_bytes).decode("ascii")
+
+        preview = self._draw_preview(bgr, xyxy, confs, idx, self.min_conf)
 
         note = "Dianggap 1 wajah (tidak ada >= 0.75 kedua)." if faces_count == 1 \
                else "Terdeteksi lebih dari 1 wajah (>= 0.75). ROI diambil dari box prioritas."
@@ -157,5 +192,7 @@ class CatFaceDetector:
                 "hi_count": self.hi_count,
                 "hi_priority": self.hi_priority
             },
-            roi_b64=roi_b64
+            preview_jpeg=preview,
+            roi_jpeg=roi_jpeg,
+            roi_b64=roi_b64,
         )
