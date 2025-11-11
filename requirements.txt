@@ -4,3 +4,6 @@ pillow
 python-multipart
 python-dotenv
 flask-cors
+ultralytics
+opencv-python
+numpy
