@@ -147,17 +147,14 @@ def read_image_bytes_from_form():
 
 
 def _upload_artifacts(base_name: str, fr) -> dict:
-    """
-    Upload preview & ROI bila tersedia. Return dict payload untuk JSON.
-    base_name: string unik (mis. timestamp + request_id) → dipakai sebagai original filename.
-    """
-    out = {"preview": None, "roi": None}
+    out = {"preview": None, "roi": None, "preview_error": None, "roi_error": None}
 
     # Preview (bounding box)
     if getattr(fr, "preview_jpeg", None):
         up = upload_image_bytes(fr.preview_jpeg, BUCKET_PREVIEW, f"{base_name}-preview.jpg")
         if up.get("ok"):
-            out["preview"] = {"filename": up.get("filename"), "url": up.get("url")}
+            d = up.get("data", up)
+            out["preview"] = {"id": d.get("id"), "filename": d.get("filename"), "url": d.get("url")}
         else:
             out["preview_error"] = up.get("message", "Upload preview failed")
 
@@ -165,11 +162,13 @@ def _upload_artifacts(base_name: str, fr) -> dict:
     if getattr(fr, "roi_jpeg", None):
         up = upload_image_bytes(fr.roi_jpeg, BUCKET_ROI, f"{base_name}-roi.jpg")
         if up.get("ok"):
-            out["roi"] = {"filename": up.get("filename"), "url": up.get("url")}
+            d = up.get("data", up)
+            out["roi"] = {"id": d.get("id"), "filename": d.get("filename"), "url": d.get("url")}
         else:
             out["roi_error"] = up.get("message", "Upload ROI failed")
 
     return out
+
 
 
 # ================== Routes ==================
