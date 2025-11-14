@@ -20,7 +20,7 @@ from PIL import Image, UnidentifiedImageError
 from utils.validation import validate_upload, MAX_FILE_MB
 from utils.responses import ok, err
 from inference import CatClassifier
-from yolo_face import CatFaceDetector
+from yolo_face_ultralytics_cpu import CatFaceDetector
 from utils.uploader import upload_image_bytes  # <--- NEW
 
 # Optional CORS
