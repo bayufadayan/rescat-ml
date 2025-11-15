@@ -14,6 +14,8 @@ import uuid
 import time
 import logging
 import io
+import hashlib
+import json
 from flask import Flask, request, g, redirect, url_for, render_template, send_file
 from dotenv import load_dotenv
 from PIL import Image, UnidentifiedImageError
@@ -23,7 +25,7 @@ from utils.validation import validate_upload, MAX_FILE_MB
 from utils.responses import ok, err
 from inference import CatClassifier
 from yolo_face import CatFaceDetector
-from utils.uploader import upload_image_bytes  # <--- NEW
+from utils.uploader import upload_image_bytes
 
 # Optional CORS
 CORS_ENABLED = os.getenv("CORS_ENABLED", "false").lower() == "true"
@@ -38,6 +40,8 @@ load_dotenv()
 THRESHOLD = float(os.getenv("THRESHOLD", "0.50"))
 TOPK = int(os.getenv("TOPK", "3"))
 PORT = int(os.getenv("PORT", "8000"))
+REMOVEBG_CACHE_DIR = os.getenv("REMOVEBG_CACHE_DIR", "cache/remove-bg")
+os.makedirs(REMOVEBG_CACHE_DIR, exist_ok=True)
 
 # Face detection (YOLO)
 CAT_HEAD_ONNX = os.getenv("CAT_HEAD_ONNX", "models/cat_head_model.onnx")
@@ -128,6 +132,10 @@ def unhandled_exception(e):
     return err("INTERNAL_ERROR", "Unexpected error", status=500)
 
 # ================== Helper Functions ==================
+
+def hash_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
 
 def read_image_bytes_from_form():
     if "file" not in request.files:
@@ -284,7 +292,18 @@ def remove_bg_route():
     - MODE 2: Pakai URL
         a) JSON body: { "url": "https://..." }
         b) atau form-data: key=url, value=<image-url>
-        c) atau query: /v1/cat/remove-bg?url=https://...
+        c) atau query: ?url=https://...
+
+    Response (sukses):
+    {
+      "ok": true,
+      "id": "...",
+      "bucket": "remove-bg",
+      "url": "https://content.rescat.life/files/remove-bg/....jpg",
+      "filename": "....jpg",
+      "hash": "sha256...",
+      "cached": false
+    }
     """
     image_bytes = None
 
@@ -311,7 +330,6 @@ def remove_bg_route():
             )
 
         try:
-            # batas ukuran file remote (sedikit di atas MAX_FILE_MB)
             max_bytes = int((MAX_FILE_MB + 1) * 1024 * 1024)
 
             resp = requests.get(
@@ -324,7 +342,7 @@ def remove_bg_route():
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
                         "Chrome/120.0 Safari/537.36"
                     )
-                }
+                },
             )
             if not resp.ok:
                 return err(
@@ -333,7 +351,6 @@ def remove_bg_route():
                     status=400,
                 )
 
-            # cek content length kalau ada
             content_length = resp.headers.get("Content-Length")
             if content_length and int(content_length) > max_bytes:
                 return err(
@@ -350,7 +367,6 @@ def remove_bg_route():
                     status=413,
                 )
 
-            # verifikasi memang image
             try:
                 img = Image.open(io.BytesIO(content))
                 img.verify()
@@ -371,25 +387,93 @@ def remove_bg_route():
                 status=400,
             )
 
+    # ---------- HASH & CACHING ----------
+    img_hash = hash_bytes(image_bytes)
+    cache_path = os.path.join(REMOVEBG_CACHE_DIR, f"{img_hash}.json")
+
+    # kalau sudah pernah diproses → ambil metadata dari cache
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            # tambahkan info hash & cached
+            meta_out = {
+                **meta,
+                "hash": img_hash,
+                "cached": True,
+            }
+            return ok(meta_out)
+        except Exception as e:
+            log.warning("Failed to read cache file %s: %s", cache_path, e)
+            # kalau gagal baca cache, lanjut proses normal
+
     # ---------- PROSES REMOVE BACKGROUND ----------
     try:
         out_bytes = remove(image_bytes)
-
-        buf = io.BytesIO(out_bytes)
-        buf.seek(0)
-
-        return send_file(
-            buf,
-            mimetype="image/png",
-            as_attachment=False,
-            download_name="removed-bg.png",
-        )
     except Exception as e:
         log.exception("REMOVE_BG_ERROR: %s", e)
         return err(
             "REMOVE_BG_ERROR",
             f"Failed to remove background: {e}",
             status=500,
+        )
+
+    # ---------- UPLOAD KE content.rescat.life/api/files ----------
+    try:
+        # pakai helper upload_image_bytes yang sudah ada
+        filename = f"{int(time.time() * 1000)}-{g.request_id}.png"
+        upload_result = upload_image_bytes(
+            out_bytes,
+            "remove-bg",           # bucket sesuai permintaan kamu
+            filename
+        )
+
+        if not upload_result.get("ok"):
+            msg = upload_result.get("message", "Upload failed")
+            return err("UPLOAD_FAILED", msg, status=502)
+
+        # struktur dari uploader: { ok: true, data: {...} } atau { ok:true, id:..., ... }
+        data = upload_result.get("data", upload_result)
+
+        file_id = data.get("id")
+        bucket = data.get("bucket", "remove-bg")
+        url = data.get("url")
+        stored_filename = data.get("filename", filename)
+
+        if not file_id or not url:
+            return err(
+                "UPLOAD_INVALID_RESPONSE",
+                "Upload service did not return id/url",
+                status=502,
+            )
+
+        # simpan metadata cache (biar next time nggak rembg + nggak upload lagi)
+        meta_to_cache = {
+            "id": file_id,
+            "bucket": bucket,
+            "url": url,
+            "filename": stored_filename,
+        }
+        try:
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(meta_to_cache, f)
+        except Exception as e:
+            log.warning("Failed to write cache file %s: %s", cache_path, e)
+
+        # response ke client
+        meta_out = {
+            **meta_to_cache,
+            "hash": img_hash,
+            "cached": False,
+        }
+        return ok(meta_out)
+
+    except Exception as e:
+        log.exception("UPLOAD_ERROR: %s", e)
+        return err(
+            "UPLOAD_ERROR",
+            f"Failed to upload removed-bg image: {e}",
+            status=502,
         )
 
 # ================== Run App ==================
