@@ -5,7 +5,7 @@ from requests.adapters import HTTPAdapter
 
 log = logging.getLogger("uploader")
 
-CONTENT_API_BASE = os.getenv("CONTENT_API_BASE", "https://content.rescat.life").rstrip("/")
+CONTENT_API_BASE = os.getenv("CONTENT_API_BASE", "https://storage.rescat.life").rstrip("/")
 TIMEOUT_CONNECT = float(os.getenv("CONTENT_API_TIMEOUT_CONNECT", "5"))
 TIMEOUT_READ = float(os.getenv("CONTENT_API_TIMEOUT_READ", "30"))
 TIMEOUT = (TIMEOUT_CONNECT, TIMEOUT_READ)
@@ -37,7 +37,7 @@ _S = _session()
 
 def upload_image_bytes(image_bytes: bytes, bucket: str, original_name: str) -> dict:
     """
-    Upload bytes gambar ke content.rescat.life
+    Upload bytes gambar ke storage.rescat.life
     - form-data: file=[FILE], bucket=[TEXT]
     Return: dict { ok, filename?, url?, id?, bucket?, raw?, status_code?, message? }
     NOTE: gunakan bytes (BUKAN BytesIO) agar Content-Length dikirim.

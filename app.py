@@ -299,7 +299,7 @@ def remove_bg_route():
       "ok": true,
       "id": "...",
       "bucket": "remove-bg",
-      "url": "https://content.rescat.life/files/remove-bg/....jpg",
+      "url": "https://storage.rescat.life/files/remove-bg/....jpg",
       "filename": "....jpg",
       "hash": "sha256...",
       "cached": false
@@ -418,7 +418,7 @@ def remove_bg_route():
             status=500,
         )
 
-    # ---------- UPLOAD KE content.rescat.life/api/files ----------
+    # ---------- UPLOAD KE storage.rescat.life/api/files ----------
     try:
         # pakai helper upload_image_bytes yang sudah ada
         filename = f"{int(time.time() * 1000)}-{g.request_id}.png"
