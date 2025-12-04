@@ -1,108 +1,68 @@
-# app.py
-"""
-ResCat API — Flask-based service for cat recognition and face detection.
-
-Features:
-- Recognize whether an image contains a cat
-- Detect cat faces and optionally return ROI
-- Return structured JSON responses with metadata
-- Health endpoint at /healthz
-"""
+"""ResCat API - Flask service for cat recognition and face detection."""
 
 import os
 import uuid
 import time
 import logging
 import io
-from flask import Flask, request, g, redirect, url_for, render_template, send_file
-from dotenv import load_dotenv
+import hashlib
+import json
+from flask import Flask, request, g, redirect, url_for, render_template
 from PIL import Image, UnidentifiedImageError
 from rembg import remove
 import requests
-from utils.validation import validate_upload, MAX_FILE_MB
+
+from config import config
+from utils.validation import validate_upload
 from utils.responses import ok, err
 from inference import CatClassifier
 from yolo_face import CatFaceDetector
-from utils.uploader import upload_image_bytes  # <--- NEW
+from utils.uploader import upload_image_bytes
 
-# Optional CORS
-CORS_ENABLED = os.getenv("CORS_ENABLED", "false").lower() == "true"
-if CORS_ENABLED:
+if config.CORS_ENABLED:
     from flask_cors import CORS
 
-# Load environment variables
-load_dotenv()
-
-# ================== Configuration ==================
-# Recognition
-THRESHOLD = float(os.getenv("THRESHOLD", "0.50"))
-TOPK = int(os.getenv("TOPK", "3"))
-PORT = int(os.getenv("PORT", "8000"))
-
-# Face detection (YOLO)
-CAT_HEAD_ONNX = os.getenv("CAT_HEAD_ONNX", "models/cat_head_model.onnx")
-CAT_HEAD_CLASSES = os.getenv("CAT_HEAD_CLASSES", "models/cat_head_classes.json")
-IMG_SIZE = int(os.getenv("IMG_SIZE", "768"))
-CONF_RAW = float(os.getenv("CONF_RAW", "0.20"))
-MIN_CONF = float(os.getenv("MIN_CONF", "0.40"))
-MID_CONF = float(os.getenv("MID_CONF", "0.50"))
-HI_COUNT = float(os.getenv("HI_COUNT", "0.75"))
-HI_PRIORITY = float(os.getenv("HI_PRIORITY", "0.80"))
-MAX_DET = int(os.getenv("MAX_DET", "5"))
-
-# Upload buckets
-BUCKET_PREVIEW = os.getenv("BUCKET_PREVIEW", "preview-bounding-box")
-BUCKET_ROI = os.getenv("BUCKET_ROI", "roi-face-cat")
-
-# ================== Logger ==================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("cat-api")
 
-# ================== Flask App ==================
 app = Flask(__name__)
-if CORS_ENABLED:
+if config.CORS_ENABLED:
     CORS(app)
 
-# Limit request size slightly above MAX_FILE_MB
-app.config["MAX_CONTENT_LENGTH"] = int((MAX_FILE_MB + 1) * 1024 * 1024)
+app.config["MAX_CONTENT_LENGTH"] = int((config.MAX_FILE_MB + 1) * 1024 * 1024)
 
-# ================== Model Loading ==================
 MODEL_READY = False
 FACE_READY = False
 
 try:
     app.classifier = CatClassifier(
-        onnx_path=os.getenv("ONNX_PATH", "models/mobilenetv3_small.onnx"),
-        classes_path=os.getenv("CLASSES_PATH", "models/imagenet_classes.txt"),
-        threshold=THRESHOLD,
-        topk=TOPK,
+        onnx_path=config.ONNX_PATH,
+        classes_path=config.CLASSES_PATH,
+        threshold=config.THRESHOLD,
+        topk=config.TOPK,
     )
     MODEL_READY = True
-    log.info("Classifier loaded successfully")
+    log.info("Classifier loaded")
 except Exception as e:
     log.exception("MODEL INIT ERROR: %s", e)
 
 try:
     app.face_detector = CatFaceDetector(
-        onnx_path=CAT_HEAD_ONNX,
-        classes_path=CAT_HEAD_CLASSES,
-        img_size=IMG_SIZE,
-        conf_raw=CONF_RAW,
-        min_conf=MIN_CONF,
-        mid_conf=MID_CONF,
-        hi_count=HI_COUNT,
-        hi_priority=HI_PRIORITY,
-        max_det=MAX_DET
+        onnx_path=config.CAT_HEAD_ONNX,
+        classes_path=config.CAT_HEAD_CLASSES,
+        img_size=config.IMG_SIZE,
+        conf_raw=config.CONF_RAW,
+        min_conf=config.MIN_CONF,
+        mid_conf=config.MID_CONF,
+        hi_count=config.HI_COUNT,
+        hi_priority=config.HI_PRIORITY,
+        max_det=config.MAX_DET
     )
     FACE_READY = True
-    log.info("Face detector loaded successfully")
+    log.info("Face detector loaded")
 except Exception as e:
     log.exception("FACE MODEL INIT ERROR: %s", e)
 
-# ================== Request Lifecycle ==================
 @app.before_request
 def before_request():
     g.request_id = str(uuid.uuid4())[:8]
@@ -113,26 +73,36 @@ def after_request(resp):
     dur_ms = int((time.time() - getattr(g, "t0", time.time())) * 1000)
     resp.headers["X-Request-ID"] = getattr(g, "request_id", "-")
     resp.headers["X-Response-Time-ms"] = str(dur_ms)
-    log.info("%s %s %s %sms rid=%s",
-             request.method, request.path, resp.status_code, dur_ms, getattr(g, "request_id", "-"))
+    log.info("%s %s %s %sms rid=%s", request.method, request.path, resp.status_code, dur_ms, getattr(g, "request_id", "-"))
     return resp
 
-# ================== Error Handlers ==================
 @app.errorhandler(413)
 def request_too_large(e):
-    return err("FILE_TOO_LARGE", f"Max {MAX_FILE_MB} MB", status=413)
+    return err("FILE_TOO_LARGE", f"Max {config.MAX_FILE_MB} MB", status=413)
 
 @app.errorhandler(Exception)
 def unhandled_exception(e):
     log.exception("UNHANDLED: %s", e)
     return err("INTERNAL_ERROR", "Unexpected error", status=500)
 
-# ================== Helper Functions ==================
+def hash_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 def read_image_bytes_from_form():
+    log.info(f"Content-Type: {request.content_type}")
+    log.info(f"request.files keys: {list(request.files.keys())}")
+    log.info(f"request.form keys: {list(request.form.keys())}")
+    log.info(f"request.headers: {dict(request.headers)}")
+    
     if "file" not in request.files:
-        return None, err("INVALID_FILE", "Expect form-data field 'file'")
+        available_keys = list(request.files.keys())
+        log.warning(f"'file' key not found. Available keys: {available_keys}")
+        return None, err("INVALID_FILE", f"Expect form-data field 'file'. Found: {available_keys}")
+    
     file = request.files["file"]
+    if not file.filename:
+        return None, err("INVALID_FILE", "No file selected")
+    
     is_valid, code, msg = validate_upload(file)
     if not is_valid:
         status = 415 if code == "UNSUPPORTED_MEDIA_TYPE" else 400
@@ -151,18 +121,16 @@ def read_image_bytes_from_form():
 def _upload_artifacts(base_name: str, fr) -> dict:
     out = {"preview": None, "roi": None, "preview_error": None, "roi_error": None}
 
-    # Preview (bounding box)
     if getattr(fr, "preview_jpeg", None):
-        up = upload_image_bytes(fr.preview_jpeg, BUCKET_PREVIEW, f"{base_name}-preview.jpg")
+        up = upload_image_bytes(fr.preview_jpeg, config.BUCKET_PREVIEW, f"{base_name}-preview.jpg")
         if up.get("ok"):
             d = up.get("data", up)
             out["preview"] = {"id": d.get("id"), "filename": d.get("filename"), "url": d.get("url")}
         else:
             out["preview_error"] = up.get("message", "Upload preview failed")
 
-    # ROI (crop)
     if getattr(fr, "roi_jpeg", None):
-        up = upload_image_bytes(fr.roi_jpeg, BUCKET_ROI, f"{base_name}-roi.jpg")
+        up = upload_image_bytes(fr.roi_jpeg, config.BUCKET_ROI, f"{base_name}-roi.jpg")
         if up.get("ok"):
             d = up.get("data", up)
             out["roi"] = {"id": d.get("id"), "filename": d.get("filename"), "url": d.get("url")}
@@ -273,28 +241,14 @@ def detect_faces():
 
 @app.post("/v1/cat/remove-bg")
 def remove_bg_route():
-    """
-    Remove background dari gambar (CPU only, unlimited, pakai rembg).
-
-    Cara pakai:
-    - MODE 1: Upload file
-        POST multipart/form-data
-        field: file (image)
-
-    - MODE 2: Pakai URL
-        a) JSON body: { "url": "https://..." }
-        b) atau form-data: key=url, value=<image-url>
-        c) atau query: /v1/cat/remove-bg?url=https://...
-    """
+    """Remove background from image using rembg."""
     image_bytes = None
 
-    # ---------- MODE 1: file upload ----------
     if "file" in request.files and request.files["file"].filename:
         image_bytes, error_resp = read_image_bytes_from_form()
         if error_resp:
             return error_resp
     else:
-        # ---------- MODE 2: URL ----------
         data = {}
         if request.is_json:
             data = request.get_json(silent=True) or {}
@@ -311,8 +265,7 @@ def remove_bg_route():
             )
 
         try:
-            # batas ukuran file remote (sedikit di atas MAX_FILE_MB)
-            max_bytes = int((MAX_FILE_MB + 1) * 1024 * 1024)
+            max_bytes = int((config.MAX_FILE_MB + 1) * 1024 * 1024)
 
             resp = requests.get(
                 url,
@@ -324,7 +277,7 @@ def remove_bg_route():
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
                         "Chrome/120.0 Safari/537.36"
                     )
-                }
+                },
             )
             if not resp.ok:
                 return err(
@@ -333,12 +286,11 @@ def remove_bg_route():
                     status=400,
                 )
 
-            # cek content length kalau ada
             content_length = resp.headers.get("Content-Length")
             if content_length and int(content_length) > max_bytes:
                 return err(
                     "FILE_TOO_LARGE",
-                    f"Remote file bigger than {MAX_FILE_MB} MB",
+                    f"Remote file bigger than {config.MAX_FILE_MB} MB",
                     status=413,
                 )
 
@@ -346,11 +298,10 @@ def remove_bg_route():
             if len(content) > max_bytes:
                 return err(
                     "FILE_TOO_LARGE",
-                    f"Remote file bigger than {MAX_FILE_MB} MB",
+                    f"Remote file bigger than {config.MAX_FILE_MB} MB",
                     status=413,
                 )
 
-            # verifikasi memang image
             try:
                 img = Image.open(io.BytesIO(content))
                 img.verify()
@@ -371,19 +322,24 @@ def remove_bg_route():
                 status=400,
             )
 
-    # ---------- PROSES REMOVE BACKGROUND ----------
+    img_hash = hash_bytes(image_bytes)
+    cache_path = os.path.join(config.REMOVEBG_CACHE_DIR, f"{img_hash}.json")
+
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            meta_out = {
+                **meta,
+                "hash": img_hash,
+                "cached": True,
+            }
+            return ok(meta_out)
+        except Exception as e:
+            log.warning("Failed to read cache file %s: %s", cache_path, e)
+
     try:
         out_bytes = remove(image_bytes)
-
-        buf = io.BytesIO(out_bytes)
-        buf.seek(0)
-
-        return send_file(
-            buf,
-            mimetype="image/png",
-            as_attachment=False,
-            download_name="removed-bg.png",
-        )
     except Exception as e:
         log.exception("REMOVE_BG_ERROR: %s", e)
         return err(
@@ -392,6 +348,58 @@ def remove_bg_route():
             status=500,
         )
 
-# ================== Run App ==================
+    try:
+        filename = f"{int(time.time() * 1000)}-{g.request_id}.png"
+        upload_result = upload_image_bytes(
+            out_bytes,
+            "remove-bg",
+            filename
+        )
+
+        if not upload_result.get("ok"):
+            msg = upload_result.get("message", "Upload failed")
+            return err("UPLOAD_FAILED", msg, status=502)
+
+        data = upload_result.get("data", upload_result)
+
+        file_id = data.get("id")
+        bucket = data.get("bucket", "remove-bg")
+        url = data.get("url")
+        stored_filename = data.get("filename", filename)
+
+        if not file_id or not url:
+            return err(
+                "UPLOAD_INVALID_RESPONSE",
+                "Upload service did not return id/url",
+                status=502,
+            )
+
+        meta_to_cache = {
+            "id": file_id,
+            "bucket": bucket,
+            "url": url,
+            "filename": stored_filename,
+        }
+        try:
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(meta_to_cache, f)
+        except Exception as e:
+            log.warning("Failed to write cache file %s: %s", cache_path, e)
+
+        meta_out = {
+            **meta_to_cache,
+            "hash": img_hash,
+            "cached": False,
+        }
+        return ok(meta_out)
+
+    except Exception as e:
+        log.exception("UPLOAD_ERROR: %s", e)
+        return err(
+            "UPLOAD_ERROR",
+            f"Failed to upload removed-bg image: {e}",
+            status=502,
+        )
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT, debug=True)
+    app.run(host="0.0.0.0", port=config.PORT, debug=True)
