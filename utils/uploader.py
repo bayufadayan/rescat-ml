@@ -1,5 +1,8 @@
-# utils/uploader.py
-import os, requests, logging
+"""Image upload utilities for storage API."""
+
+import os
+import requests
+import logging
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 
@@ -12,6 +15,7 @@ TIMEOUT = (TIMEOUT_CONNECT, TIMEOUT_READ)
 
 
 def _session():
+    """Create requests session with retry configuration."""
     s = requests.Session()
     retries = Retry(
         total=3,
@@ -36,15 +40,9 @@ _S = _session()
 
 
 def upload_image_bytes(image_bytes: bytes, bucket: str, original_name: str) -> dict:
-    """
-    Upload bytes gambar ke storage.rescat.life
-    - form-data: file=[FILE], bucket=[TEXT]
-    Return: dict { ok, filename?, url?, id?, bucket?, raw?, status_code?, message? }
-    NOTE: gunakan bytes (BUKAN BytesIO) agar Content-Length dikirim.
-    """
+    """Upload image bytes to storage API."""
     url = f"{CONTENT_API_BASE}/api/files"
     files = {
-        # penting: pakai BYTES, bukan io.BytesIO, agar Content-Length terisi & tidak pakai chunked
         "file": (original_name, image_bytes, "image/jpeg"),
     }
     data = {"bucket": bucket}
