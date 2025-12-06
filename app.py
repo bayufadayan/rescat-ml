@@ -436,12 +436,46 @@ def landmark_route():
             return err("INVALID_URL", "URL must be a non-empty string", status=400)
         
         try:
-            resp = requests.get(file_url, timeout=15)
-            resp.raise_for_status()
+            max_bytes = int((config.MAX_FILE_MB + 1) * 1024 * 1024)
+            
+            resp = requests.get(
+                file_url,
+                timeout=15,
+                stream=True,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0 Safari/537.36"
+                    )
+                },
+            )
+            if not resp.ok:
+                return err(
+                    "FETCH_FAILED",
+                    f"Failed to fetch image from URL (status {resp.status_code})",
+                    status=400,
+                )
+            
+            content_length = resp.headers.get("Content-Length")
+            if content_length and int(content_length) > max_bytes:
+                return err(
+                    "FILE_TOO_LARGE",
+                    f"Remote file bigger than {config.MAX_FILE_MB} MB",
+                    status=413,
+                )
+            
             content = resp.content
+            if len(content) > max_bytes:
+                return err(
+                    "FILE_TOO_LARGE",
+                    f"Remote file bigger than {config.MAX_FILE_MB} MB",
+                    status=413,
+                )
             
             try:
-                Image.open(io.BytesIO(content)).verify()
+                img = Image.open(io.BytesIO(content))
+                img.verify()
             except UnidentifiedImageError:
                 return err("UNSUPPORTED_MEDIA_TYPE", "URL does not point to a valid image", status=415)
             
@@ -497,7 +531,29 @@ def landmark_route():
             log.exception("UPLOAD_ERROR for %s: %s", name, e)
             return err("UPLOAD_ERROR", f"Failed to upload {name}: {e}", status=502)
     
+    try:
+        landmarked_filename = f"landmarked_{base_name}.jpg"
+        landmarked_upload = upload_image_bytes(
+            result.landmarked_image,
+            config.BUCKET_LANDMARKED_FACE,
+            landmarked_filename
+        )
+        
+        if not landmarked_upload.get("ok"):
+            msg = landmarked_upload.get("message", "Upload failed")
+            return err("UPLOAD_ERROR", f"Failed to upload landmarked image: {msg}", status=502)
+        
+        landmarked_data = landmarked_upload.get("data") or landmarked_upload
+        landmarked_url = landmarked_data.get("url")
+        
+        if not landmarked_url:
+            return err("UPLOAD_INVALID_RESPONSE", "Upload service did not return url for landmarked image", status=502)
+    except Exception as e:
+        log.exception("UPLOAD_ERROR for landmarked_image: %s", e)
+        return err("UPLOAD_ERROR", f"Failed to upload landmarked image: {e}", status=502)
+    
     return ok({
+        "landmarked_face": landmarked_url,
         "right_eye_crop": uploaded_urls["right_eye_crop"],
         "left_eye_crop": uploaded_urls["left_eye_crop"],
         "mouth_crop": uploaded_urls["mouth_crop"],
