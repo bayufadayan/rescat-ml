@@ -523,7 +523,7 @@ def landmark_route():
     }
     
     base_name = f"{int(time.time()*1000)}-{g.request_id}"
-    uploaded_urls = {}
+    uploaded_meta = {}
     
     for name, crop_bytes in crops.items():
         try:
@@ -541,7 +541,10 @@ def landmark_route():
             if not url:
                 return err("UPLOAD_INVALID_RESPONSE", f"Upload service did not return url for {name}", status=502)
             
-            uploaded_urls[bucket_name] = url
+            uploaded_meta[name] = {
+                "id": data.get("id"),
+                "url": url,
+            }
         except Exception as e:
             log.exception("UPLOAD_ERROR for %s: %s", name, e)
             return err("UPLOAD_ERROR", f"Failed to upload {name}: {e}", status=502)
@@ -567,14 +570,21 @@ def landmark_route():
         log.exception("UPLOAD_ERROR for landmarked_image: %s", e)
         return err("UPLOAD_ERROR", f"Failed to upload landmarked image: {e}", status=502)
     
-    return ok({
-        "landmarked_face": landmarked_url,
-        "right_eye_crop": uploaded_urls["right_eye_crop"],
-        "left_eye_crop": uploaded_urls["left_eye_crop"],
-        "mouth_crop": uploaded_urls["mouth_crop"],
-        "right_ear_crop": uploaded_urls["right_ear_crop"],
-        "left_ear_crop": uploaded_urls["left_ear_crop"],
-    })
+    response_payload = {
+        "landmark": {
+            "img_landmark_id": landmarked_data.get("id"),
+            "img_landmark_url": landmarked_url,
+        }
+    }
+
+    for area_name in ["right_eye", "left_eye", "mouth", "right_ear", "left_ear"]:
+        meta = uploaded_meta.get(area_name, {})
+        response_payload[area_name] = {
+            f"img_{area_name}_id": meta.get("id"),
+            f"img_{area_name}_url": meta.get("url"),
+        }
+    
+    return ok(response_payload)
 
 @app.post("/v1/cat/area-check")
 def area_check():
@@ -623,7 +633,7 @@ def area_check():
     
     # Fetch images and process
     classification_results = {}
-    gradcam_urls = {}
+    gradcam_payload = {}
     
     for area_name in area_names:
         url = data[area_name]
@@ -686,7 +696,10 @@ def area_check():
             if not gradcam_url:
                 return err("UPLOAD_INVALID_RESPONSE", f"Upload service did not return url for {area_name} gradcam", status=502)
             
-            gradcam_urls[area_name] = gradcam_url
+            gradcam_payload[area_name] = {
+                f"img_{area_name}_gradcam_id": gradcam_data.get("id"),
+                f"img_{area_name}_gradcam_url": gradcam_url,
+            }
             
         except requests.RequestException as e:
             log.exception(f"FETCH_URL_ERROR for {area_name}: %s", e)
@@ -697,7 +710,7 @@ def area_check():
     
     return ok({
         "classification": classification_results,
-        "gradcam": gradcam_urls
+        "gradcam": gradcam_payload
     })
 
 if __name__ == "__main__":
