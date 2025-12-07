@@ -3,7 +3,7 @@ from PIL import Image
 import io
 import tensorflow as tf
 from tensorflow import keras
-from tensorflow.keras.applications.efficientnet import preprocess_input
+from tensorflow.keras.applications.efficientnet import preprocess_input # type: ignore
 from matplotlib import cm
 
 
