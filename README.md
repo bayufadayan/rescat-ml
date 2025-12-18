@@ -19,7 +19,7 @@ Run the setup script to automatically configure everything:
 ```powershell
 .\setup.ps1
 ```
-
+  
 This will:
 - ✅ Check Python installation
 - ✅ Create virtual environment
